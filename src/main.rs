@@ -1,16 +1,26 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, env};
 
 use xivc_core::{
+    enums::{Clan, DamageInstance, Job},
+    math::{
+        ActionStat, EotSnapshot,
+        HitTypeHandle::{self, *},
+        PlayerInfo, PlayerStats, SpeedStat, WeaponInfo, XivMath,
+    },
     status_effect,
     world::{
         status::{StatusEffect, StatusInstance, StatusSnapshot},
         ActorId,
-    }, math::{HitTypeHandle, XivMath, PlayerStats, WeaponInfo, PlayerInfo, ActionStat, SpeedStat, EotSnapshot}, enums::{Clan, Job},
+    },
 };
 
-fn main() {
-    use HitTypeHandle::*;
+const PS: StatusEffect = status_effect!(
+    "Power Surge" 30000 { damage { out = 110 / 100 } }
+);
 
+const TICKS: &[u64] = include!("../incl.rs.req");
+
+fn main() {
     let math = XivMath::new(
         PlayerStats {
             str: 3229,
@@ -39,29 +49,70 @@ fn main() {
         },
     );
 
-    const PS: StatusEffect = status_effect!(
-        "Power Surge" 30000 { damage { out = 110 / 100 } }
-    );
 
-    let snap = math.dot_damage_snapshot(
-        45,
-        ActionStat::AttackPower,
-        100,
-        SpeedStat::SkillSpeed,
-        &StatusSnapshot {
-            source: &[StatusInstance {
-                effect: PS,
-                source: ActorId(0),
-                stack: 1,
-                time: 1,
-            }],
-            source_gauge: &[],
-            target: &[],
-        },
-    );
+    let mut args = env::args();
+    // skip first arg
+    args.next();
 
+    let pre = match args.next().as_deref() {
+        Some("pre") => true,
+        Some("post") => false,
+        _ => panic!("1st arg must be pre or post"),
+    };
 
-    let gmm = |c, d| (snap.dot_damage(c, d, 9500))..=(snap.dot_damage(c, d, 10500));
+    let check_range = match args.next().as_deref() {
+        Some("check_range") => true,
+        Some("check_holes") => false,
+        _ => panic!("2nd arg must be check_range or check_holes"),
+    };
+
+    if pre {
+        let s = math.dot_damage_snapshot(
+            45,
+            ActionStat::AttackPower,
+            100,
+            SpeedStat::SkillSpeed,
+            &StatusSnapshot {
+                source: &[StatusInstance {
+                    effect: PS,
+                    source: ActorId(0),
+                    stack: 1,
+                    time: 1,
+                }],
+                source_gauge: &[],
+                target: &[],
+            },
+        );
+        if check_range {
+            check_all_in_ex_range(s);
+        } else {
+            check_for_holes(s);
+        }
+    } else {
+        let s = PostRandBuff {
+            inner: math.dot_damage_snapshot(
+                45,
+                ActionStat::AttackPower,
+                100,
+                SpeedStat::SkillSpeed,
+                &StatusSnapshot {
+                    source: &[],
+                    source_gauge: &[],
+                    target: &[],
+                },
+            ),
+            buff: StatusInstance::new(ActorId(0), PS),
+        };
+        if check_range {
+            check_all_in_ex_range(s);
+        } else {
+            check_for_holes(s);
+        }
+    }
+}
+
+fn check_all_in_ex_range(s: impl Snapshot) {
+    let gmm = |c, d| s.tick(c, d, 9500)..=s.tick(c, d, 10500);
 
     let n = gmm(No, No);
     let d = gmm(No, Yes);
@@ -69,21 +120,29 @@ fn main() {
     let cd = gmm(Yes, Yes);
 
     eprintln!();
-    eprintln!("ex nh range {:?}", n);
-    eprintln!("ex dh range {:?}", d);
-    eprintln!("ex ch range {:?}", c);
-    eprintln!("ex cdh range {:?}", cd);
+    eprintln!("expected nh range {:?}", n);
+    eprintln!("expected dh range {:?}", d);
+    eprintln!("expected ch range {:?}", c);
+    eprintln!("expected cdh range {:?}", cd);
     eprintln!();
+    
+    let mut found_invalid = false;
 
-    let slice: &[u64] = include!("../incl.rs");
-    for &x in slice {
+    for &x in TICKS {
         let in_expected_ranges =
             n.contains(&x) || d.contains(&x) || c.contains(&x) || cd.contains(&x);
         if !in_expected_ranges {
-            eprintln!("found ??? value: {}", x);
+            found_invalid = true;
+            println!("found unknown value: {}", x);
         }
     }
+    
+    if found_invalid {
+        eprintln!("found unknown values");
+    }
+}
 
+fn check_for_holes(s: impl Snapshot) {
     for ch in [No, Yes] {
         for dh in [No, Yes] {
             let name = match (ch, dh) {
@@ -94,8 +153,8 @@ fn main() {
                 _ => unreachable!(),
             };
 
-            let ex_min = snap.dot_damage(ch, dh, 9500);
-            let ex_max = snap.dot_damage(ch, dh, 10500);
+            let ex_min = s.tick(ch, dh, 9500);
+            let ex_max = s.tick(ch, dh, 10500);
 
             let mut real_holes = HashSet::<u64>::new();
 
@@ -104,7 +163,7 @@ fn main() {
             let mut rl_min = u64::MAX;
             let mut rl_max = 0;
 
-            for &x in slice {
+            for &x in TICKS {
                 if (ex_min..=ex_max).contains(&x) {
                     set.insert(x);
                     rl_min = x.min(rl_min);
@@ -114,7 +173,7 @@ fn main() {
 
             eprintln!(
                 "starting {name} - ex avg {}, ex min {}, ex max {}, rl min {}, rl max {}",
-                snap.dot_damage(ch, dh, 10000),
+                s.tick(ch, dh, 10000),
                 ex_min,
                 ex_max,
                 rl_min,
@@ -139,20 +198,21 @@ fn main() {
                 eprintln!("found hole in range");
             }
 
-            println!("starting expected postbuff hole check ({name}):");
+            println!("starting expected hole check ({name}):");
 
-            let min = snap.base * 9500 / 10000;
-            let max = snap.base * 10500 / 10000;
-
-            let run = |x: u64| x * crt_mod(&snap, ch) / 1000000 * dh_mod(&snap, dh) / 1000000;
+            // this is just to make sure i hit every value in the range
+            // i'm not sure if this is how it really works
+            // but its not a problem to check *too* many values.
+            let min = s.base_rand(9500);
+            let max = s.base_rand(10500);
 
             let mut prev = 0;
 
             for x in min..=max {
                 if prev == 0 {
-                    prev = run(x);
+                    prev = s.rand_to_dmg(x, ch, dh);
                 } else {
-                    let p = run(x);
+                    let p = s.rand_to_dmg(x, ch, dh);
                     for x in (prev + 1)..=(p - 1) {
                         println!(
                             "    {} {}",
@@ -166,6 +226,45 @@ fn main() {
 
             eprintln!()
         }
+    }
+}
+
+trait Snapshot {
+    fn tick(&self, ch: HitTypeHandle, dh: HitTypeHandle, rand: u64) -> u64 {
+        self.rand_to_dmg(self.base_rand(rand), ch, dh)
+    }
+    fn base_rand(&self, rand: u64) -> u64;
+    fn rand_to_dmg(&self, val: u64, ch: HitTypeHandle, dh: HitTypeHandle) -> u64;
+}
+
+impl Snapshot for EotSnapshot {
+    fn base_rand(&self, rand: u64) -> u64 {
+        self.base * rand / 10000
+    }
+
+    fn rand_to_dmg(&self, val: u64, ch: HitTypeHandle, dh: HitTypeHandle) -> u64 {
+        val * crt_mod(self, ch) / 1000000 * dh_mod(self, dh) / 1000000
+    }
+}
+
+struct PostRandBuff {
+    inner: EotSnapshot,
+    buff: StatusInstance,
+}
+
+impl Snapshot for PostRandBuff {
+    fn base_rand(&self, rand: u64) -> u64 {
+        self.inner.base_rand(rand)
+    }
+
+    fn rand_to_dmg(&self, val: u64, ch: HitTypeHandle, dh: HitTypeHandle) -> u64 {
+        let dmgbuff = self.buff.effect.damage.outgoing.unwrap();
+        let base = self.inner.rand_to_dmg(val, ch, dh);
+        dmgbuff(
+            self.buff,
+            DamageInstance::basic(base, ActionStat::AttackPower),
+        )
+        .dmg
     }
 }
 
